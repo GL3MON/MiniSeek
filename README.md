@@ -10,7 +10,7 @@
 - Utilizes a sparse computation approach by segmenting experts into finer granularity and isolating shared experts, enabling efficient training and better parameter utilization.
 
 ## Features in Development
-- Device-Limited Routin
+- Device-Limited Routing
 - Auxiliary Loss for Load Balance
 - Flexible Training Pipeline and Inference Pipeline
 - Distributed and Parallel training
