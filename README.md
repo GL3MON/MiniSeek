@@ -1,5 +1,5 @@
 # MiniSeek
-*An Pytorch implementation of an LLM inspired from Deepseek*
+*An Pytorch implementation of an LLM inspired from Deepseek(⚠️ Currently in implementation)*
 
 ## Current Features
 
