@@ -8,7 +8,7 @@ def precompute_theta_frequencies(
     head_dim: int, seq_len: int, device: str, theta: float = 10000.0
 ):
 
-    theta = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float())).to(device)
+    theta = 1.0 / (theta ** ((torch.arange(0, head_dim, 2).float())/head_dim)).to(device)
     seq_idx = torch.arange(seq_len, device=device)
     freqs = torch.outer(seq_idx, theta).float()
 
@@ -19,10 +19,10 @@ def precompute_theta_frequencies(
 
 def apply_rotary_embeddings(x: torch.Tensor, freq_complex: torch.Tensor, device: str):
 
-    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:1], -1, 2))
-    freq_complex = freq_complex.unsqueeze_(0).unsqueeze_(2)
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    freq_complex_align = freq_complex.unsqueeze(0).unsqueeze(2)
 
-    x_rotated = x_complex * freq_complex
+    x_rotated = x_complex * freq_complex_align
 
     x_out = torch.view_as_real(x_rotated)
     x_out = x_out.reshape(*x.shape)
@@ -32,29 +32,32 @@ def apply_rotary_embeddings(x: torch.Tensor, freq_complex: torch.Tensor, device:
 
 class MultiHeadedLatentAttention(nn.Module):
 
-    def __init__(self, dim, latent_kv_dim, latent_q_dim, n_heads, decop_rot_dim):
-
-        # Compressed Latent Vectors
-        self.latent_kv = nn.Linear(dim, latent_kv_dim, bias=False)
-        self.latent_q = nn.Linear(dim, latent_q_dim, bias=False)
+    def __init__(self,dim, head_dim, latent_kv_dim, latent_q_dim, n_heads, decop_rot_dim):
+        super().__init__()
 
         self.dim = dim
         self.n_heads = n_heads
         self.latent_kv_dim = latent_kv_dim
         self.latent_q_dim = latent_kv_dim
-        self.head_dim = dim // n_heads
+        self.head_dim =head_dim
         self.decop_rot_dim = decop_rot_dim
+        self.expert_dim = latent_q_dim
+
+        self.latent_kv = nn.Linear(self.dim, latent_kv_dim, bias=False)
+        self.latent_q = nn.Linear(self.dim, latent_q_dim, bias=False)
 
         self.query = nn.Linear(latent_q_dim, self.n_heads * self.head_dim, bias=False)
         self.key = nn.Linear(latent_kv_dim, self.n_heads * self.head_dim, bias=False)
         self.value = nn.Linear(latent_kv_dim, self.n_heads * self.head_dim, bias=False)
 
         self.decop_rot_q = nn.Linear(latent_q_dim, self.n_heads * self.decop_rot_dim)
-        self.decop_rot_k = nn.Linear(dim, self.n_heads * self.decop_rot_dim)
+        self.decop_rot_k = nn.Linear(self.dim, self.n_heads * self.decop_rot_dim)
 
-        self.out_proj = nn.Linear(self.head_dim * self.n_heads, self.dim)
+        self.out_proj = nn.Linear(self.head_dim * self.n_heads, self.expert_dim)
 
-    def forward(self, x, freq_complex):
+
+    def forward(self, x, freq_complex: torch.Tensor):
+        x: torch.Tensor = x
 
         batch_size, seq_len, _ = x.shape
 
@@ -68,25 +71,32 @@ class MultiHeadedLatentAttention(nn.Module):
         kr = self.decop_rot_k(x)
 
         v = self.value(ckv)
+        
 
-        qr = qr.view(batch_size, seq_len, self.n_heads, self.head_dim)
+        qr = qr.view(batch_size, seq_len, self.n_heads, self.decop_rot_dim)
         qr = apply_rotary_embeddings(qr, freq_complex, device=x.device)
         q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)
         q = torch.cat((q, qr), dim=-1)
 
-        kr = kr.view(batch_size, seq_len, self.n_heads, self.head_dim)
-        kr = apply_rotary_embeddings(x, freq_complex, device=x.device)
+        kr = kr.view(batch_size, seq_len, self.n_heads, self.decop_rot_dim)
+        kr = apply_rotary_embeddings(kr, freq_complex, device=x.device)
         k = k.view(batch_size, seq_len, self.n_heads, self.head_dim)
         k = torch.cat((k, kr), dim=-1)
+
+        v = v.view(batch_size, seq_len, self.n_heads, self.head_dim)
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
+        print(f"query: {q.shape} key: {k.shape} value: {v.shape}")
+
         att_scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(
             self.head_dim + self.decop_rot_dim
         )
         att_scores = F.softmax(att_scores.float(), dim=-1).type_as(q)
+
+        print(f"Att Scores: {att_scores.shape}")
 
         output = torch.matmul(att_scores, v)
 
