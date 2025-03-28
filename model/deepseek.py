@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import math
+from ..config import Paramaters
 
 
 def precompute_theta_frequencies(
@@ -29,31 +30,43 @@ def apply_rotary_embeddings(x: torch.Tensor, freq_complex: torch.Tensor, device:
 
     return x_out.type_as(x).to(device)
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+
+        self.eps = eps
+        self.w = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        return self.w * self._norm(x.float()).type_as(x)
 
 class MultiHeadedLatentAttention(nn.Module):
 
-    def __init__(self,dim, head_dim, latent_kv_dim, latent_q_dim, n_heads, decop_rot_dim):
+    def __init__(self, args: Paramaters):
         super().__init__()
 
-        self.dim = dim
-        self.n_heads = n_heads
-        self.latent_kv_dim = latent_kv_dim
-        self.latent_q_dim = latent_kv_dim
-        self.head_dim =head_dim
-        self.decop_rot_dim = decop_rot_dim
-        self.expert_dim = latent_q_dim
+        self.dim = args.dim
+        self.n_heads = args.n_heads
+        self.latent_kv_dim = args.latent_kv_dim
+        self.latent_q_dim = args.latent_q_dim
+        self.head_dim = args.head_dim
+        self.decop_rot_dim = args.decop_rot_dim
+        self.expert_dim = args.latent_q_dim
 
-        self.latent_kv = nn.Linear(self.dim, latent_kv_dim, bias=False)
-        self.latent_q = nn.Linear(self.dim, latent_q_dim, bias=False)
+        self.latent_kv = nn.Linear(self.dim, self.latent_kv_dim, bias=False)
+        self.latent_q = nn.Linear(self.dim, self.latent_q_dim, bias=False)
 
-        self.query = nn.Linear(latent_q_dim, self.n_heads * self.head_dim, bias=False)
-        self.key = nn.Linear(latent_kv_dim, self.n_heads * self.head_dim, bias=False)
-        self.value = nn.Linear(latent_kv_dim, self.n_heads * self.head_dim, bias=False)
+        self.query = nn.Linear(self.latent_q_dim, self.n_heads * self.head_dim, bias=False)
+        self.key = nn.Linear(self.latent_kv_dim, self.n_heads * self.head_dim, bias=False)
+        self.value = nn.Linear(self.latent_kv_dim, self.n_heads * self.head_dim, bias=False)
 
-        self.decop_rot_q = nn.Linear(latent_q_dim, self.n_heads * self.decop_rot_dim)
+        self.decop_rot_q = nn.Linear(self.latent_q_dim, self.n_heads * self.decop_rot_dim)
         self.decop_rot_k = nn.Linear(self.dim, self.n_heads * self.decop_rot_dim)
 
-        self.out_proj = nn.Linear(self.head_dim * self.n_heads, self.expert_dim)
+        self.out_proj = nn.Linear(self.head_dim * self.n_heads, self.)
 
 
     def forward(self, x, freq_complex: torch.Tensor):
@@ -107,87 +120,68 @@ class MultiHeadedLatentAttention(nn.Module):
 
 class Expert(nn.Module):
 
-    def __init__(self, n_embd):
+    def __init__(self, dim, expert_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(0.5),
+            nn.Linear(dim, expert_dim),
+            nn.Linear(expert_dim, dim),
+            nn.GELU(),
         )
 
     def forward(self, x):
         return self.net(x)
 
 
-class NoisyTopKRouter(nn.Module):
-
-    def __init__(self, n_embd, n_experts, top_k):
-        super().__init__()
-        self.top_k = top_k
-        self.top_k_route = nn.Linear(n_embd, n_experts)
-        self.noise = nn.Linear(n_embd, n_experts)
-
-    def forward(self, x):
-        r_act = self.top_k_route(x)
-        noise = self.noise(x)
-
-        noise = torch.randn_like(r_act) * F.softplus(noise)
-        noisy_r_act = r_act + noise
-
-        topk_logits, idx = noisy_r_act.topk(self.top_k, dim=-1)
-        zeros = torch.full_like(noisy_r_act, float("-inf"))
-        sparse_logits = zeros.scatter(-1, idx, topk_logits)
-        r_out = F.softmax(sparse_logits, dim=-1)
-        return r_out, idx, noisy_r_act
-
-
 class DeepSeekMoE(nn.Module):
-    def __init__(self, n_embd, n_r_experts, n_s_experts, topk):
+    
+    def __init__(self, args: Paramaters):
         super().__init__()
-        self.router = NoisyTopKRouter(n_embd, n_r_experts, topk)
-        self.r_experts = nn.ModuleList([Expert(n_embd) for _ in range(n_r_experts)])
-        self.s_experts = nn.ModuleList([Expert(n_embd) for _ in range(n_s_experts)])
-        self.topk = topk
+        self.dim = args.dim
+        self.n_s_experts = args.n_s_experts
+        self.n_r_experts = args.n_r_experts
+        self.top_k = args.topk
+        self.expert_dim = args.expert_dim
+        
+        self.shared_experts = nn.ModuleList([
+            Expert(self.dim, self.expert_dim) for _ in range(self.n_s_experts)
+        ])
 
-    def forward(self, x):
-        gate_out, idx, noisy_r_act = self.router(x)
-        f_out = torch.zeros_like(x)
+        self.routed_experts = nn.ModuleList([
+            Expert(dim, self.expert_dim) for _ in range(self.n_r_experts)
+        ])
 
-        flat_x = x.view(-1, x.size(-1))
-        flat_gate_output = gate_out.view(-1, gate_out.size(-1))
+        self.centroids = nn.Parameter(torch.randn(self.n_r_experts, self.dim))
 
-        for i, expert in enumerate(self.r_experts):
-            expert_mask = (idx == i).any(dim=-1)
-            flat_mask = expert_mask.view(-1)
+        self.rms_norm = RMSNorm(dim=self.dim)
 
-            if flat_mask.any():
-                expert_input = flat_x[flat_mask]
-                expert_output = expert(expert_input)
+    def forward(self, x: torch.Tensor):
+        batch_size, seq_len, _ = x.shape
 
-                gating_scores = flat_gate_output[flat_mask, i].unsqueeze_(1)
-                weighted_output = expert_output * gating_scores
+        x = self.rms_norm(x)
 
-                f_out[expert_mask] += weighted_output.squeeze(1)
+        shared_out = torch.zeros_like(x)
+        for expert in self.shared_experts:
+            shared_out += expert(x)
+        
+        x_flat = x.view(-1, self.dim)
+        
+        affinity = torch.matmul(x_flat, self.centroids.T)
+        affinity = F.softmax(affinity, dim = -1)
 
-        for i, expert in enumerate(self.s_experts):
-            f_out += expert(x)
+        topk_scores, topk_indices = torch.topk(affinity, self.top_k, dim=-1)
+        mask = torch.zeros_like(affinity)
+        mask.scatter_(-1, topk_indices, topk_scores)
 
-        return x + f_out, idx
+        routed_out = torch.zeros_like(x_flat)
+        for i in range(self.n_r_experts):
+            expert_mask = mask[:, i].unsqueeze(-1)
+            expert_out = self.routed_experts[i](x_flat)
+            routed_out += expert_mask * expert_out
 
+        routed_out = routed_out.view(batch_size, seq_len, self.dim)
 
-class RMSNorm(nn.Module):
-    def __init__(self, n_embd, eps=1e-6):
-        super().__init__()
+        return x + shared_out + routed_out, affinity
 
-        self.eps = eps
-        self.w = nn.Parameter(torch.ones(n_embd))
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        return self.w * self._norm(x.float()).type_as(x)
 
 
 class Block(nn.Module):
