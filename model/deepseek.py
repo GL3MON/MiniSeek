@@ -55,6 +55,7 @@ class MultiHeadedLatentAttention(nn.Module):
         self.head_dim = args.head_dim
         self.decop_rot_dim = args.decop_rot_dim
         self.expert_dim = args.latent_q_dim
+        self.seq_len = args.seq_len
 
         self.latent_kv = nn.Linear(self.dim, self.latent_kv_dim, bias=False)
         self.latent_q = nn.Linear(self.dim, self.latent_q_dim, bias=False)
@@ -66,11 +67,12 @@ class MultiHeadedLatentAttention(nn.Module):
         self.decop_rot_q = nn.Linear(self.latent_q_dim, self.n_heads * self.decop_rot_dim)
         self.decop_rot_k = nn.Linear(self.dim, self.n_heads * self.decop_rot_dim)
 
-        self.out_proj = nn.Linear(self.head_dim * self.n_heads, self.)
+        self.out_proj = nn.Linear(self.head_dim * self.n_heads, self.dim)
+
+        self.register_buffer('tril', torch.tril(torch.ones(self.seq_len, self.seq_len)))
 
 
-    def forward(self, x, freq_complex: torch.Tensor):
-        x: torch.Tensor = x
+    def forward(self, x: torch.Tensor, freq_complex: torch.Tensor, masked: bool = False):
 
         batch_size, seq_len, _ = x.shape
 
@@ -107,16 +109,19 @@ class MultiHeadedLatentAttention(nn.Module):
         att_scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(
             self.head_dim + self.decop_rot_dim
         )
+        
+        if masked:
+            att_scores = att_scores.masked_fill(self.tril[ : self.seq_len, : self.seq_len] == 0, float('-inf'))
+
         att_scores = F.softmax(att_scores.float(), dim=-1).type_as(q)
 
-        print(f"Att Scores: {att_scores.shape}")
+        print(f"Att Scores: {att_scores}")
 
         output = torch.matmul(att_scores, v)
 
         output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
 
         return self.out_proj(output)
-
 
 class Expert(nn.Module):
 
@@ -147,7 +152,7 @@ class DeepSeekMoE(nn.Module):
         ])
 
         self.routed_experts = nn.ModuleList([
-            Expert(dim, self.expert_dim) for _ in range(self.n_r_experts)
+            Expert(self.dim, self.expert_dim) for _ in range(self.n_r_experts)
         ])
 
         self.centroids = nn.Parameter(torch.randn(self.n_r_experts, self.dim))
@@ -188,32 +193,26 @@ class Block(nn.Module):
 
     def __init__(
         self,
-        n_embd,
-        latent_kv_dim,
-        latent_q_dim,
-        n_heads,
-        decop_rot_dim,
-        n_r_experts,
-        n_s_experts,
-        topk,
+        args: Paramaters,
+        id: int,
     ):
-        self.rms_norm_1 = RMSNorm(n_embd=n_embd)
-        self.mla_1 = MultiHeadedLatentAttention(
-            dim=n_embd,
-            latent_kv_dim=latent_kv_dim,
-            latent_q_dim=latent_q_dim,
-            n_heads=n_heads,
-            decop_rot_dim=decop_rot_dim,
-        )
+        self.rms_norm_1 = RMSNorm(dim=args.dim)
+        self.mla_1 = MultiHeadedLatentAttention(args=args)
 
-        self.rms_norm_2 = RMSNorm(n_embd=n_embd)
-        self.moe = DeepSeekMoE(
-            n_embd=n_embd, n_r_experts=n_r_experts, n_s_experts=n_s_experts, topk=topk
-        )
+        self.rms_norm_2 = RMSNorm(dim=args.dim)
+        
+        if (id !=0):
+            self.moe = DeepSeekMoE(args=args)
+        else:
+            self.ffn = Expert(args.dim, args.expert_dim)
 
     def forward(self, x, freqs_complex):
         x += self.mla_1(self.rms_norm_1(x), freqs_complex)
-        x += self.moe(self.rms_norm_2(x))
+
+        if (id != 0):
+            x += self.moe(self.rms_norm_2(x))
+        else:
+            x += self.ffn(self.rms_norm_2(x))
         return x
 
 
@@ -221,53 +220,29 @@ class Transformer(nn.Module):
 
     def __init__(
         self,
-        seq_len,
-        n_embd,
-        latent_kv_dim,
-        latent_q_dim,
-        n_heads,
-        decop_rot_dim,
-        n_r_experts,
-        n_s_experts,
-        topk,
-        n_layers,
-        vocab_size,
+        args: Paramaters,
         device,
     ):
-        self.n_layers = n_layers
-        self.n_embd = n_embd
-        self.vocab_size = vocab_size
-        self.n_heads = n_heads
-        self.seq_len = seq_len
+        self.n_layers = args.n_layers
+        self.dim = args.dim
+        self.head_dim = args.head_dim
+        self.vocab_size = args.vocab_sizee
+        self.n_heads = args.head_dim
+        self.seq_len = args.seq_len
         self.device = device
-        self.latent_kv_dim = latent_kv_dim
-        self.latent_q_dim = latent_q_dim
-        self.decop_rot_dim = decop_rot_dim
-        self.n_r_experts = n_r_experts
-        self.n_s_experts = n_s_experts
-        self.topk = topk
 
-        self.token_embeddings = nn.Embedding(self.vocab_size, self.n_embd)
+        self.token_embeddings = nn.Embedding(self.vocab_size, self.dim)
         self.layers = nn.ModuleList(
             [
-                Block(
-                    n_embd,
-                    latent_kv_dim,
-                    latent_q_dim,
-                    n_heads,
-                    decop_rot_dim,
-                    n_r_experts,
-                    n_s_experts,
-                    topk,
-                )
-                for _ in range(self.n_layers)
+                Block(args=args, id = i)
+                for i in range(self.n_layers)
             ]
         )
 
-        self.lm_head = nn.Linear(self.n_embd, self.vocab_size, bias=False)
+        self.lm_head = nn.Linear(self.dim, self.vocab_size, bias=False)
 
         self.freq_complex = precompute_theta_frequencies(
-            self.n_embd // self.n_heads, self.seq_len, device
+            self.head_dim, self.seq_len, device
         )
 
     def forward(self, x):
