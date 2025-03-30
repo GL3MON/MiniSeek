@@ -1,5 +1,5 @@
 ### MiniSeek: A Lightweight DeepSeek V-3 Inspired Model ⚠️(On Progress)
-```MiniSeek is a lightweight, open-source language model inspired by DeepSeek V-3, designed for efficient training and inference on consumer hardware while maintaining competitive performance.```
+*MiniSeek is a lightweight, open-source language model inspired by DeepSeek V-3, designed for efficient training and inference on consumer hardware while maintaining competitive performance.*
 
 ## Features
 # Multi-Head Latent Attention (MLA)
